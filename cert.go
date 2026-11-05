@@ -15,6 +15,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -73,17 +75,7 @@ func (m *mkcert) makeCert(hosts []string) {
 		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 	}
 
-	for _, h := range hosts {
-		if ip := net.ParseIP(h); ip != nil {
-			tpl.IPAddresses = append(tpl.IPAddresses, ip)
-		} else if email, err := mail.ParseAddress(h); err == nil && email.Address == h {
-			tpl.EmailAddresses = append(tpl.EmailAddresses, h)
-		} else if uriName, err := url.Parse(h); err == nil && uriName.Scheme != "" && uriName.Host != "" {
-			tpl.URIs = append(tpl.URIs, uriName)
-		} else {
-			tpl.DNSNames = append(tpl.DNSNames, h)
-		}
-	}
+	assignHosts(tpl, hosts)
 
 	if m.client {
 		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
@@ -161,6 +153,36 @@ func (m *mkcert) printHosts(hosts []string) {
 			break
 		}
 	}
+}
+
+// assignHosts populates the SAN fields of a certificate template, classifying
+// each name as an IP address, email address, URL or DNS name.
+func assignHosts(tpl *x509.Certificate, hosts []string) {
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			tpl.IPAddresses = append(tpl.IPAddresses, ip)
+		} else if email, err := mail.ParseAddress(h); err == nil && email.Address == h {
+			tpl.EmailAddresses = append(tpl.EmailAddresses, h)
+		} else if uriName, err := url.Parse(h); err == nil && uriName.Scheme != "" && uriName.Host != "" {
+			tpl.URIs = append(tpl.URIs, uriName)
+		} else {
+			tpl.DNSNames = append(tpl.DNSNames, h)
+		}
+	}
+}
+
+// hostsFromCertificate reads back the SANs of an existing certificate.
+func hostsFromCertificate(c *x509.Certificate) []string {
+	var hosts []string
+	hosts = append(hosts, c.DNSNames...)
+	hosts = append(hosts, c.EmailAddresses...)
+	for _, ip := range c.IPAddresses {
+		hosts = append(hosts, ip.String())
+	}
+	for _, u := range c.URIs {
+		hosts = append(hosts, u.String())
+	}
+	return hosts
 }
 
 func (m *mkcert) generateKey(rootCA bool) (crypto.PrivateKey, error) {
@@ -365,4 +387,326 @@ func (m *mkcert) newCA() {
 
 func (m *mkcert) caUniqueName() string {
 	return "mkcert development CA " + m.caCert.SerialNumber.String()
+}
+
+const (
+	// defaultRenewBefore is the default renewal threshold: a certificate is
+	// replaced only if it expires within this window.
+	defaultRenewBefore = 30 * 24 * time.Hour
+	// renewClockSkewLeeway tolerates small clock differences between machines:
+	// renewed certificates are backdated by it, and a certificate that is
+	// more than it short of being valid yet is treated as renewable.
+	renewClockSkewLeeway = 5 * time.Minute
+)
+
+// renewCerts renews the given certificate files in place. A file is replaced
+// only if its certificate is expired, not yet valid (beyond the clock skew
+// leeway) or expires within m.renewBefore. A failure on one file doesn't
+// prevent the other files from being renewed.
+func (m *mkcert) renewCerts(paths []string) {
+	if m.caKey == nil {
+		log.Fatalln("ERROR: can't renew certificates because the CA key (rootCA-key.pem) is missing")
+	}
+	if len(paths) == 0 {
+		log.Fatalln("ERROR: specify at least one certificate file to renew, e.g. \"mkcert -renew example.com.pem\"")
+	}
+
+	failed := 0
+	for _, path := range paths {
+		renewed, err := m.renewCert(path)
+		if err != nil {
+			log.Printf("ERROR: failed to renew %q: %s", path, err)
+			failed++
+		} else if renewed {
+			continue
+		}
+	}
+	if failed > 0 {
+		log.Fatalf("ERROR: %d of %d certificate(s) failed to renew", failed, len(paths))
+	}
+}
+
+// renewCert reads the SANs and the issuer of the certificate at certPath and
+// replaces it with a freshly issued one only if the remaining validity is
+// below m.renewBefore, the certificate already expired, or it is not valid
+// yet beyond the clock skew leeway. It reports whether the certificate was
+// replaced. Corrupted or foreign certificates are rejected without touching
+// any files.
+func (m *mkcert) renewCert(certPath string) (bool, error) {
+	data, err := ioutil.ReadFile(certPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read the certificate: %w", err)
+	}
+
+	// A mkcert PEM file holds a certificate and, when the certificate and the
+	// key share a path, a private key as well.
+	var certBlock, keyBlock *pem.Block
+	for rest := data; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		switch block.Type {
+		case "CERTIFICATE":
+			if certBlock == nil {
+				certBlock = block
+			}
+		case "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY":
+			if keyBlock == nil {
+				keyBlock = block
+			}
+		}
+	}
+	if certBlock == nil {
+		return false, errors.New("corrupted certificate: no PEM CERTIFICATE block found, regenerate it with \"mkcert <hosts>\"")
+	}
+	leaf, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		return false, fmt.Errorf("corrupted certificate: failed to parse it (%v), regenerate it with \"mkcert <hosts>\"", err)
+	}
+
+	// Only renew certificates issued by this local CA. CheckSignatureFrom
+	// verifies the issuer identity and the signature regardless of validity,
+	// so it works for expired or not-yet-valid certificates too.
+	if err := leaf.CheckSignatureFrom(m.caCert); err != nil {
+		return false, fmt.Errorf("it was not issued by the local CA %q (%v)", m.caCert.Subject.CommonName, err)
+	}
+	hosts := hostsFromCertificate(leaf)
+
+	now := time.Now()
+	expiringSoon := now.Add(m.renewBefore).After(leaf.NotAfter)
+	notYetValid := now.Before(leaf.NotBefore.Add(-renewClockSkewLeeway))
+	if !expiringSoon && !notYetValid {
+		log.Printf("%q is valid until %s (%s); skipping renewal ✅",
+			certPath, leaf.NotAfter.Format("2 January 2006"), formatRemaining(leaf.NotAfter.Sub(now)))
+		return false, nil
+	}
+
+	combined := keyBlock != nil
+	keyPath := keyPathForCert(certPath)
+
+	// Reusing the key is an explicit choice via -reuse-key; a fresh key is
+	// generated otherwise.
+	var priv crypto.PrivateKey
+	if m.reuseKey {
+		if combined {
+			priv, err = parsePrivateKeyPEM(pem.EncodeToMemory(keyBlock))
+		} else {
+			var keyBytes []byte
+			keyBytes, err = ioutil.ReadFile(keyPath)
+			if err != nil {
+				return false, fmt.Errorf("failed to read the existing key at %q (drop -reuse-key to generate a new one): %w", keyPath, err)
+			}
+			priv, err = parsePrivateKeyPEM(keyBytes)
+		}
+		if err != nil {
+			return false, fmt.Errorf("failed to parse the existing private key: %w", err)
+		}
+	} else {
+		priv, err = m.generateKey(false)
+		if err != nil {
+			return false, fmt.Errorf("failed to generate the certificate key: %w", err)
+		}
+	}
+	pub := priv.(crypto.Signer).Public()
+
+	expiration := now.AddDate(2, 3, 0)
+	tpl := &x509.Certificate{
+		SerialNumber: randomSerialNumber(),
+		Subject: pkix.Name{
+			Organization:       []string{"mkcert development certificate"},
+			OrganizationalUnit: []string{userAndHostname},
+		},
+
+		// Backdate the certificate slightly to tolerate clock skew.
+		NotBefore: now.Add(-renewClockSkewLeeway),
+		NotAfter:  expiration,
+
+		// Preserve the SANs and key usages of the existing certificate.
+		KeyUsage:           leaf.KeyUsage,
+		ExtKeyUsage:        append([]x509.ExtKeyUsage(nil), leaf.ExtKeyUsage...),
+		UnknownExtKeyUsage: append([]asn1.ObjectIdentifier(nil), leaf.UnknownExtKeyUsage...),
+	}
+	assignHosts(tpl, hosts)
+
+	certDER, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, pub, m.caKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to generate the certificate: %w", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return false, fmt.Errorf("failed to encode the certificate key: %w", err)
+	}
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+
+	log.Printf("Renewing %q (issued by %q) 🔄", certPath, m.caCert.Subject.CommonName)
+	for _, h := range hosts {
+		log.Printf(" - %q", h)
+	}
+
+	var certBackup, keyBackup string
+	if combined {
+		certBackup, err = writeFileAtomic(certPath, append(certPEM, privPEM...), permFor(certPath, 0600))
+		if err != nil {
+			return false, err
+		}
+	} else {
+		// Replace the certificate first, then the key, so a reused key never
+		// leaves the certificate pointing at a non-existent key.
+		certBackup, err = writeFileAtomic(certPath, certPEM, permFor(certPath, 0644))
+		if err != nil {
+			return false, err
+		}
+		if !m.reuseKey {
+			keyBackup, err = writeFileAtomic(keyPath, privPEM, permFor(keyPath, 0600))
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if certBackup != "" {
+		log.Printf("The previous certificate was backed up to %q 💾", certBackup)
+	}
+	if keyBackup != "" {
+		log.Printf("The previous key was backed up to %q 💾", keyBackup)
+	}
+	switch {
+	case combined:
+		log.Printf("The renewed certificate and key are at %q ✅\n", certPath)
+	case m.reuseKey:
+		log.Printf("The renewed certificate is at %q, reusing the key at %q ✅\n", certPath, keyPath)
+	default:
+		log.Printf("The renewed certificate is at %q and the new key at %q ✅\n", certPath, keyPath)
+	}
+	log.Printf("It will expire on %s 🗓\n\n", expiration.Format("2 January 2006"))
+
+	return true, nil
+}
+
+// keyPathForCert returns the conventional mkcert key path for a certificate
+// file path: "foo.pem" -> "foo-key.pem".
+func keyPathForCert(certPath string) string {
+	if strings.HasSuffix(certPath, ".pem") {
+		return strings.TrimSuffix(certPath, ".pem") + "-key.pem"
+	}
+	return certPath + "-key.pem"
+}
+
+// parsePrivateKeyPEM parses a PKCS #8, PKCS #1 RSA or SEC1 EC PEM private key.
+func parsePrivateKeyPEM(b []byte) (crypto.PrivateKey, error) {
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, errors.New("no PEM block found")
+	}
+	switch block.Type {
+	case "PRIVATE KEY":
+		return x509.ParsePKCS8PrivateKey(block.Bytes)
+	case "RSA PRIVATE KEY":
+		return x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "EC PRIVATE KEY":
+		return x509.ParseECPrivateKey(block.Bytes)
+	default:
+		return nil, fmt.Errorf("unexpected PEM block type %q, want a private key", block.Type)
+	}
+}
+
+// permFor returns the permission bits of path, or fallback if it doesn't
+// exist or has no meaningful permission bits.
+func permFor(path string, fallback os.FileMode) os.FileMode {
+	if fi, err := os.Stat(path); err == nil {
+		if perm := fi.Mode().Perm(); perm != 0 {
+			return perm
+		}
+	}
+	return fallback
+}
+
+// writeFileAtomic writes data to path through a temp file in the same
+// directory followed by an atomic rename, so readers never observe a
+// half-written file. If path already exists, it is copied to a unique
+// timestamped backup before the replacement and the backup path is returned.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) (backup string, err error) {
+	dir := filepath.Dir(path)
+	tmp, err := ioutil.TempFile(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create a temporary file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("failed to write the temporary file: %w", err)
+	}
+	if err = tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("failed to set the permissions of the temporary file: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("failed to flush the temporary file: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return "", fmt.Errorf("failed to close the temporary file: %w", err)
+	}
+
+	// Keep a backup of the old content before swapping the files.
+	if _, statErr := os.Stat(path); statErr == nil {
+		if backup, err = backupFile(path); err != nil {
+			return "", err
+		}
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return "", fmt.Errorf("failed to replace %q atomically: %w", path, err)
+	}
+	return backup, nil
+}
+
+// backupFile copies path to a unique timestamped backup next to it, preserving
+// the original permission bits. The original file is left in place.
+func backupFile(path string) (string, error) {
+	old, err := ioutil.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %q for the backup: %w", path, err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat %q for the backup: %w", path, err)
+	}
+	backup := backupName(path, time.Now().UTC())
+	if err := ioutil.WriteFile(backup, old, fi.Mode().Perm()); err != nil {
+		return "", fmt.Errorf("failed to write the backup %q: %w", backup, err)
+	}
+	return backup, nil
+}
+
+// backupName returns a non-existing backup name for path.
+func backupName(path string, t time.Time) string {
+	base := fmt.Sprintf("%s.bak-%s", path, t.Format("20060102T150405Z"))
+	name := base
+	for i := 2; pathExists(name); i++ {
+		name = fmt.Sprintf("%s-%d", base, i)
+	}
+	return name
+}
+
+// formatRemaining renders the time left before a certificate expires.
+func formatRemaining(d time.Duration) string {
+	if d < 0 {
+		return "expired " + pluralDays(int((-d).Hours()/24)) + " ago"
+	}
+	return pluralDays(int(d.Hours()/24)) + " remaining"
+}
+
+func pluralDays(days int) string {
+	if days == 1 {
+		return "1 day"
+	}
+	return strconv.Itoa(days) + " days"
 }

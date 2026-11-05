@@ -23,6 +23,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/idna"
 )
@@ -44,6 +45,10 @@ const shortUsage = `Usage of mkcert:
 	$ mkcert -uninstall
 	Uninstall the local CA (but do not delete it).
 
+	$ mkcert -renew example.com.pem
+	Renew "example.com.pem" in place if it expires soon, reusing
+	the names and issuer of the existing certificate.
+
 `
 
 const advancedUsage = `Advanced options:
@@ -64,6 +69,20 @@ const advancedUsage = `Advanced options:
 	-csr CSR
 	    Generate a certificate based on the supplied CSR. Conflicts with
 	    all other flags and arguments except -install and -cert-file.
+
+	-renew CERT-FILE...
+	    Renew the given certificate file(s) in place, reading the names and
+	    the issuer from the existing certificates. A certificate is only
+	    replaced if it is expired, not yet valid, or expires within
+	    -renew-before. The old files are kept as backups.
+
+	-renew-before DURATION
+	    Renew certificates that expire within this duration (default 720h,
+	    i.e. 30 days).
+
+	-reuse-key
+	    Reuse the existing private key when renewing. Without this flag a
+	    new key is generated and the old key file is backed up as well.
 
 	-CAROOT
 	    Print the CA certificate and key storage location.
@@ -103,6 +122,9 @@ func main() {
 		keyFileFlag   = flag.String("key-file", "", "")
 		p12FileFlag   = flag.String("p12-file", "", "")
 		versionFlag   = flag.Bool("version", false, "")
+		renewFlag     = flag.Bool("renew", false, "")
+		renewBefore   = flag.Duration("renew-before", defaultRenewBefore, "")
+		reuseKeyFlag  = flag.Bool("reuse-key", false, "")
 	)
 	flag.Usage = func() {
 		fmt.Fprint(flag.CommandLine.Output(), shortUsage)
@@ -142,9 +164,30 @@ func main() {
 	if *csrFlag != "" && flag.NArg() != 0 {
 		log.Fatalln("ERROR: can't specify extra arguments when using -csr")
 	}
+	if *renewFlag {
+		if *installFlag || *uninstallFlag {
+			log.Fatalln("ERROR: you can't combine -renew with -install or -uninstall")
+		}
+		if *csrFlag != "" {
+			log.Fatalln("ERROR: you can't combine -renew with -csr")
+		}
+		if *pkcs12Flag {
+			log.Fatalln("ERROR: you can't combine -renew with -pkcs12")
+		}
+		if *clientFlag {
+			log.Fatalln("ERROR: -renew preserves the certificate usages, so don't combine it with -client")
+		}
+		if *certFileFlag != "" || *keyFileFlag != "" || *p12FileFlag != "" {
+			log.Fatalln("ERROR: pass the certificate file path(s) to -renew directly, not via -cert-file/-key-file/-p12-file")
+		}
+		if *renewBefore < 0 {
+			log.Fatalln("ERROR: -renew-before can't be negative")
+		}
+	}
 	(&mkcert{
 		installMode: *installFlag, uninstallMode: *uninstallFlag, csrPath: *csrFlag,
 		pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag,
+		renewMode: *renewFlag, reuseKey: *reuseKeyFlag, renewBefore: *renewBefore,
 		certFile: *certFileFlag, keyFile: *keyFileFlag, p12File: *p12FileFlag,
 	}).Run(flag.Args())
 }
@@ -155,6 +198,8 @@ const rootKeyName = "rootCA-key.pem"
 type mkcert struct {
 	installMode, uninstallMode bool
 	pkcs12, ecdsa, client      bool
+	renewMode, reuseKey        bool
+	renewBefore                time.Duration
 	keyFile, certFile, p12File string
 	csrPath                    string
 
@@ -175,6 +220,11 @@ func (m *mkcert) Run(args []string) {
 	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
 	m.loadCA()
+
+	if m.renewMode {
+		m.renewCerts(args)
+		return
+	}
 
 	if m.installMode {
 		m.install()
