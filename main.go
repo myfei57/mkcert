@@ -44,6 +44,9 @@ const shortUsage = `Usage of mkcert:
 	$ mkcert -uninstall
 	Uninstall the local CA (but do not delete it).
 
+	$ mkcert -check CERT [KEY]
+	Check that a PEM certificate and private key match (read-only).
+
 `
 
 const advancedUsage = `Advanced options:
@@ -64,6 +67,19 @@ const advancedUsage = `Advanced options:
 	-csr CSR
 	    Generate a certificate based on the supplied CSR. Conflicts with
 	    all other flags and arguments except -install and -cert-file.
+
+	-check CERT [KEY]
+	    Read a PEM certificate and a private key, derive the public key
+	    from each, and report whether they match. With a single argument,
+	    the certificate and the key are read from the same (combined) PEM
+	    file. Read-only: it does not generate anything or touch the CA,
+	    and it never prints the private key. Exit codes: 0 match,
+	    1 mismatch, 2 unreadable or unparseable (incl. wrong password),
+	    3 unsupported key type.
+
+	-password-file FILE
+	    Password for an encrypted private key when using -check.
+	    Use "-" to read the password from standard input.
 
 	-CAROOT
 	    Print the CA certificate and key storage location.
@@ -91,18 +107,20 @@ func main() {
 	}
 	log.SetFlags(0)
 	var (
-		installFlag   = flag.Bool("install", false, "")
-		uninstallFlag = flag.Bool("uninstall", false, "")
-		pkcs12Flag    = flag.Bool("pkcs12", false, "")
-		ecdsaFlag     = flag.Bool("ecdsa", false, "")
-		clientFlag    = flag.Bool("client", false, "")
-		helpFlag      = flag.Bool("help", false, "")
-		carootFlag    = flag.Bool("CAROOT", false, "")
-		csrFlag       = flag.String("csr", "", "")
-		certFileFlag  = flag.String("cert-file", "", "")
-		keyFileFlag   = flag.String("key-file", "", "")
-		p12FileFlag   = flag.String("p12-file", "", "")
-		versionFlag   = flag.Bool("version", false, "")
+		installFlag      = flag.Bool("install", false, "")
+		uninstallFlag    = flag.Bool("uninstall", false, "")
+		pkcs12Flag       = flag.Bool("pkcs12", false, "")
+		ecdsaFlag        = flag.Bool("ecdsa", false, "")
+		clientFlag       = flag.Bool("client", false, "")
+		helpFlag         = flag.Bool("help", false, "")
+		carootFlag       = flag.Bool("CAROOT", false, "")
+		csrFlag          = flag.String("csr", "", "")
+		certFileFlag     = flag.String("cert-file", "", "")
+		keyFileFlag      = flag.String("key-file", "", "")
+		p12FileFlag      = flag.String("p12-file", "", "")
+		versionFlag      = flag.Bool("version", false, "")
+		checkFlag        = flag.Bool("check", false, "")
+		passwordFileFlag = flag.String("password-file", "", "")
 	)
 	flag.Usage = func() {
 		fmt.Fprint(flag.CommandLine.Output(), shortUsage)
@@ -125,6 +143,23 @@ func main() {
 		}
 		fmt.Println("(unknown)")
 		return
+	}
+	if *checkFlag {
+		if *installFlag || *uninstallFlag || *carootFlag {
+			log.Println("ERROR: you can't combine -check with -install, -uninstall or -CAROOT")
+			os.Exit(2)
+		}
+		if *csrFlag != "" || *pkcs12Flag || *ecdsaFlag || *clientFlag || *p12FileFlag != "" {
+			log.Println("ERROR: -check can't be combined with -csr, -pkcs12, -ecdsa, -client or -p12-file")
+			os.Exit(2)
+		}
+		certPath, keyPath, err := resolveCheckPaths(flag.Args(), *certFileFlag, *keyFileFlag)
+		if err != nil {
+			log.Printf("ERROR: %s", err)
+			flag.Usage()
+			os.Exit(2)
+		}
+		os.Exit(runCheck(certPath, keyPath, *passwordFileFlag))
 	}
 	if *carootFlag {
 		if *installFlag || *uninstallFlag {

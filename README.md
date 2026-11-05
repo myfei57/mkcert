@@ -155,6 +155,40 @@ To only install the local root CA into a subset of them, you can set the `TRUST_
 mkcert -key-file key.pem -cert-file cert.pem example.com *.example.com
 ```
 
+### Checking that a certificate and key match
+
+`mkcert -check` reads a PEM certificate and a private key, derives the public
+key from each, and reports whether they match. It is strictly read-only: it
+never generates a certificate, touches the CA, installs a trust root, or
+prints the private key.
+
+```
+mkcert -check example.pem example-key.pem
+```
+
+A single argument reads both the certificate and the key from the same
+(combined) PEM file, such as a chain file or one produced with matching
+`-cert-file` and `-key-file` paths:
+
+```
+mkcert -check bundle.pem
+```
+
+When a file contains multiple certificates, the first one is used and the
+rest are ignored. Encrypted private keys are supported with a password read
+from a file (use `-` for standard input):
+
+```
+mkcert -check -password-file password.txt example.pem example-key.pem
+```
+
+The exit code reports the result so the command can be used in scripts:
+
+* `0`: the certificate and the private key match
+* `1`: they parse fine but do not match
+* `2`: an input can't be read or parsed (including a wrong password)
+* `3`: an unsupported key type was encountered
+
 ### S/MIME
 
 mkcert automatically generates an S/MIME certificate if one of the supplied names is an email address.
