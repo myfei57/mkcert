@@ -65,6 +65,13 @@ const advancedUsage = `Advanced options:
 	    Generate a certificate based on the supplied CSR. Conflicts with
 	    all other flags and arguments except -install and -cert-file.
 
+	-audit-log FILE
+	    Append a JSON line for each issued certificate to FILE, with the
+	    serial number, issuance and expiration times, SAN types and the
+	    certificate SHA-256 fingerprint. Private keys, CSRs and passwords
+	    are never recorded. If the entry can't be written, the certificate
+	    is still saved and mkcert exits with status 2.
+
 	-CAROOT
 	    Print the CA certificate and key storage location.
 
@@ -102,6 +109,7 @@ func main() {
 		certFileFlag  = flag.String("cert-file", "", "")
 		keyFileFlag   = flag.String("key-file", "", "")
 		p12FileFlag   = flag.String("p12-file", "", "")
+		auditLogFlag  = flag.String("audit-log", "", "")
 		versionFlag   = flag.Bool("version", false, "")
 	)
 	flag.Usage = func() {
@@ -146,6 +154,7 @@ func main() {
 		installMode: *installFlag, uninstallMode: *uninstallFlag, csrPath: *csrFlag,
 		pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag,
 		certFile: *certFileFlag, keyFile: *keyFileFlag, p12File: *p12FileFlag,
+		auditLog: *auditLogFlag,
 	}).Run(flag.Args())
 }
 
@@ -156,6 +165,7 @@ type mkcert struct {
 	installMode, uninstallMode bool
 	pkcs12, ecdsa, client      bool
 	keyFile, certFile, p12File string
+	auditLog                   string
 	csrPath                    string
 
 	CAROOT string

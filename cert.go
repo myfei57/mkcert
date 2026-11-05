@@ -104,6 +104,9 @@ func (m *mkcert) makeCert(hosts []string) {
 	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, pub, m.caKey)
 	fatalIfErr(err, "failed to generate certificate")
 
+	domainCert, err := x509.ParseCertificate(cert)
+	fatalIfErr(err, "failed to parse generated certificate")
+
 	certFile, keyFile, p12File := m.fileNames(hosts)
 
 	if !m.pkcs12 {
@@ -122,7 +125,6 @@ func (m *mkcert) makeCert(hosts []string) {
 			fatalIfErr(err, "failed to save certificate key")
 		}
 	} else {
-		domainCert, _ := x509.ParseCertificate(cert)
 		pfxData, err := pkcs12.Encode(rand.Reader, priv, domainCert, []*x509.Certificate{m.caCert}, "changeit")
 		fatalIfErr(err, "failed to generate PKCS#12")
 		err = ioutil.WriteFile(p12File, pfxData, 0644)
@@ -143,6 +145,8 @@ func (m *mkcert) makeCert(hosts []string) {
 	}
 
 	log.Printf("It will expire on %s 🗓\n\n", expiration.Format("2 January 2006"))
+
+	m.auditCertificate(domainCert)
 }
 
 func (m *mkcert) printHosts(hosts []string) {
@@ -276,6 +280,10 @@ func (m *mkcert) makeCertFromCSR() {
 	log.Printf("\nThe certificate is at \"%s\" ✅\n\n", certFile)
 
 	log.Printf("It will expire on %s 🗓\n\n", expiration.Format("2 January 2006"))
+
+	// Audit from the parsed certificate only: the CSR itself (and any of its
+	// contents beyond what ended up in the certificate) is never recorded.
+	m.auditCertificate(c)
 }
 
 // loadCA will load or create the CA at CAROOT.
