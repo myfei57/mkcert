@@ -97,3 +97,75 @@ func (m *mkcert) uninstallPlatform() bool {
 
 	return true
 }
+
+// planSystemStore builds the read-only dry-run plan for the Linux system
+// trust store. It only stats files and verifies the certificate; it never
+// writes an anchor or runs the update command.
+func (m *mkcert) planSystemStore(install bool) dryRunStore {
+	s := dryRunStore{name: "Linux system trust store", detected: true}
+	priv := adminPrivilegesNote()
+	rootCert := filepath.Join(m.CAROOT, rootName)
+	updateCmd := strings.Join(SystemTrustCommand, " ")
+
+	if SystemTrustCommand == nil {
+		s.available = false
+		s.diagnostic = "No supported system trust mechanism was detected: none of the anchor directories exist " +
+			`(looked for "/etc/pki/ca-trust/source/anchors/", "/usr/local/share/ca-certificates/", ` +
+			`"/etc/ca-certificates/trust-source/anchors/" and "/usr/share/pki/trust/anchors"). ` +
+			`Install your distribution's ca-certificates package (for example "apt install ca-certificates" ` +
+			`or "yum install ca-certificates"), or manually copy "` + rootCert +
+			`" into an anchor directory and run its update command as root.`
+		return s
+	}
+	s.available = true
+
+	anchor := fmt.Sprintf(SystemTrustFilename, strings.Replace(m.caNameOrPlaceholder(), " ", "_", -1))
+	legacyFilename := fmt.Sprintf(SystemTrustFilename, "mkcert-rootCA")
+	installed := m.caCert != nil && m.checkPlatform()
+
+	if install {
+		state := stateWouldInstall
+		if m.caCert == nil {
+			state = stateUnknown
+		} else if installed {
+			state = stateAlready
+		}
+		s.targets = append(s.targets, dryRunTarget{
+			path:       anchor,
+			action:     fmt.Sprintf("write the CA certificate with \"tee %s\" as root, then run \"%s\"", anchor, updateCmd),
+			privileges: priv,
+			state:      state,
+		})
+		return s
+	}
+
+	if pathExists(anchor) {
+		s.targets = append(s.targets, dryRunTarget{
+			path:       anchor,
+			action:     fmt.Sprintf("remove with \"rm -f %s\" as root, then run \"%s\"", anchor, updateCmd),
+			privileges: priv,
+			state:      stateWouldRemove,
+		})
+	} else {
+		state := stateAbsent
+		if m.caCert == nil {
+			state = stateUnknown
+		}
+		s.targets = append(s.targets, dryRunTarget{
+			path:       anchor,
+			action:     "no anchor file present; the update command would still run if other entries changed",
+			privileges: priv,
+			state:      state,
+		})
+	}
+	// The legacy non-unique filename is only removed when actually present.
+	if pathExists(legacyFilename) {
+		s.targets = append(s.targets, dryRunTarget{
+			path:       legacyFilename,
+			action:     fmt.Sprintf("remove legacy anchor with \"rm -f %s\" as root", legacyFilename),
+			privileges: priv,
+			state:      stateWouldRemove,
+		})
+	}
+	return s
+}

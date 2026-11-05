@@ -66,6 +66,66 @@ func (m *mkcert) uninstallPlatform() bool {
 	return true
 }
 
+// planSystemStore builds the read-only dry-run plan for the Windows system
+// trust store. It opens the ROOT store and enumerates certificates, but
+// never adds or deletes anything.
+func (m *mkcert) planSystemStore(install bool) dryRunStore {
+	s := dryRunStore{name: `Windows system certificate store "ROOT"`, detected: true}
+	priv := adminPrivilegesNote()
+	rootCert := filepath.Join(m.CAROOT, rootName)
+
+	store, err := openWindowsRootStore()
+	if err != nil {
+		s.available = false
+		s.diagnostic = fmt.Sprintf("Could not open the ROOT certificate store for a read-only probe: %v. "+
+			"Make sure crypt32.dll is available and the current user profile is accessible, then re-run.", err)
+		return s
+	}
+	defer store.close()
+	s.available = true
+
+	state := stateUnknown
+	var enumErr error
+	if m.caCert != nil {
+		var found bool
+		found, enumErr = store.hasCertWithSerial(m.caCert.SerialNumber)
+		if enumErr != nil {
+			// Fall back to chain verification if enumeration fails.
+			found = m.checkPlatform()
+		}
+		if install {
+			if found {
+				state = stateAlready
+			} else {
+				state = stateWouldInstall
+			}
+		} else {
+			if found {
+				state = stateWouldRemove
+			} else {
+				state = stateAbsent
+			}
+		}
+	}
+
+	action := ""
+	if install {
+		action = fmt.Sprintf("decode %q and call crypt32 CertAddEncodedCertificateToStore (CERT_STORE_ADD_REPLACE_EXISTING)", rootCert)
+	} else {
+		action = "call crypt32 CertDeleteCertificateFromStore for every certificate matching the CA serial number"
+	}
+	s.targets = append(s.targets, dryRunTarget{
+		path:       `certificate store "ROOT"`,
+		action:     action,
+		privileges: priv,
+		state:      state,
+	})
+	if enumErr != nil {
+		s.diagnostic = fmt.Sprintf("Read-only certificate enumeration failed (%v); the reported state comes from chain verification instead.", enumErr)
+	}
+	return s
+}
+
 type windowsRootStore uintptr
 
 func openWindowsRootStore() (windowsRootStore, error) {
@@ -134,4 +194,26 @@ func (w windowsRootStore) deleteCertsWithSerial(serial *big.Int) (bool, error) {
 		}
 	}
 	return deletedAny, nil
+}
+
+// hasCertWithSerial reports whether the store contains a certificate with
+// the given serial number. It only enumerates the store and never modifies
+// it, so it is safe to use during a dry run.
+func (w windowsRootStore) hasCertWithSerial(serial *big.Int) (bool, error) {
+	var cert *syscall.CertContext
+	for {
+		certPtr, _, err := procCertEnumCertificatesInStore.Call(uintptr(w), uintptr(unsafe.Pointer(cert)))
+		if cert = (*syscall.CertContext)(unsafe.Pointer(certPtr)); cert == nil {
+			if errno, ok := err.(syscall.Errno); ok && errno == 0x80092004 {
+				break
+			}
+			return false, fmt.Errorf("failed enumerating certs: %v", err)
+		}
+		certBytes := (*[1 << 20]byte)(unsafe.Pointer(cert.EncodedCert))[:cert.Length]
+		parsedCert, err := x509.ParseCertificate(certBytes)
+		if err == nil && parsedCert.SerialNumber != nil && parsedCert.SerialNumber.Cmp(serial) == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

@@ -15,6 +15,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -305,6 +306,54 @@ func (m *mkcert) loadCA() {
 	}
 	m.caKey, err = x509.ParsePKCS8PrivateKey(keyDERBlock.Bytes)
 	fatalIfErr(err, "failed to parse the CA key")
+}
+
+// dryRunCAInfo describes the on-disk state of the local CA as found by a
+// read-only inspection. It is only used by the -dry-run report.
+type dryRunCAInfo struct {
+	CAROOT       string
+	CAROOTExists bool
+	CertExists   bool
+	KeyExists    bool
+	Err          error
+}
+
+// loadCADryRun inspects the CAROOT and parses the CA certificate without
+// creating anything on disk, so that -dry-run never modifies the system.
+func (m *mkcert) loadCADryRun() dryRunCAInfo {
+	info := dryRunCAInfo{CAROOT: m.CAROOT}
+	if st, err := os.Stat(m.CAROOT); err == nil && st.IsDir() {
+		info.CAROOTExists = true
+	}
+	certPath := filepath.Join(m.CAROOT, rootName)
+	keyPath := filepath.Join(m.CAROOT, rootKeyName)
+	info.CertExists = pathExists(certPath)
+	info.KeyExists = pathExists(keyPath)
+	if !info.CertExists {
+		return info
+	}
+
+	certPEMBlock, err := ioutil.ReadFile(certPath)
+	if err != nil {
+		info.Err = err
+		return info
+	}
+	certDERBlock, _ := pem.Decode(certPEMBlock)
+	if certDERBlock == nil || certDERBlock.Type != "CERTIFICATE" {
+		info.Err = fmt.Errorf("failed to read the CA certificate: unexpected content")
+		return info
+	}
+	m.caCert, info.Err = x509.ParseCertificate(certDERBlock.Bytes)
+	return info
+}
+
+// caNameOrPlaceholder returns the unique CA name used as a trust store
+// identifier, or a placeholder when the CA has not been created yet.
+func (m *mkcert) caNameOrPlaceholder() string {
+	if m.caCert == nil {
+		return "mkcert development CA <not created yet>"
+	}
+	return m.caUniqueName()
 }
 
 func (m *mkcert) newCA() {

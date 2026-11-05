@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -126,6 +127,106 @@ func execCertutil(cmd *exec.Cmd) ([]byte, error) {
 		out, err = cmd.CombinedOutput()
 	}
 	return out, err
+}
+
+// planNSSStore builds the read-only dry-run plan for the NSS trust stores
+// (Firefox and, on Linux, Chrome/Chromium). It only enumerates profile
+// directories and runs "certutil -V"; it never adds or deletes certificates.
+func (m *mkcert) planNSSStore(install bool) dryRunStore {
+	s := dryRunStore{name: NSSBrowsers + " NSS trust store"}
+	priv := "runs as the current user; sudo is only used as a fallback if a security database is read-only"
+	rootCert := filepath.Join(m.CAROOT, rootName)
+	op := "install"
+	if !install {
+		op = "uninstall"
+	}
+
+	if !hasNSS {
+		s.detected = false
+		s.diagnostic = fmt.Sprintf("No NSS security database or browser installation was detected at: %s. "+
+			"Install %s, or start it at least once so it creates a profile, then re-run.",
+			strings.Join(nssSearchPaths(), ", "), NSSBrowsers)
+		return s
+	}
+	s.detected = true
+
+	var profiles []string
+	m.forEachNSSProfile(func(profile string) { profiles = append(profiles, profile) })
+
+	if !hasCertutil {
+		s.available = false
+		if CertutilInstallHelp != "" {
+			s.diagnostic = fmt.Sprintf("%q is not available, so the CA can't be %sed automatically. "+
+				"Install it with %q, then re-run \"mkcert -%sinstall\".",
+				"certutil", op, CertutilInstallHelp, op)
+		} else {
+			s.diagnostic = fmt.Sprintf("%s support through %q is not available on this platform; manage the browser trust store manually.",
+				NSSBrowsers, "certutil")
+		}
+	} else {
+		s.available = true
+	}
+
+	if len(profiles) == 0 {
+		s.diagnostic += fmt.Sprintf("No NSS security databases (cert9.db/cert8.db) were found in %s. "+
+			"If you never started %s, do that at least once to initialize its profile.",
+			strings.Join(nssSearchPaths(), ", "), NSSBrowsers)
+		return s
+	}
+
+	for _, profile := range profiles {
+		state := stateUnknown
+		if m.caCert != nil && hasCertutil {
+			present := exec.Command(certutilPath, "-V", "-d", profile, "-u", "L", "-n", m.caUniqueName()).Run() == nil
+			if install {
+				if present {
+					state = stateAlready
+				} else {
+					state = stateWouldInstall
+				}
+			} else {
+				if present {
+					state = stateWouldRemove
+				} else {
+					state = stateAbsent
+				}
+			}
+		}
+		action := ""
+		if install {
+			action = fmt.Sprintf("%q -A -d %s -t C,, -n %q -i %q", certutilName(), profile, m.caNameOrPlaceholder(), rootCert)
+		} else {
+			action = fmt.Sprintf("%q -D -d %s -n %q", certutilName(), profile, m.caNameOrPlaceholder())
+		}
+		s.targets = append(s.targets, dryRunTarget{
+			path:       "NSS database " + profile,
+			action:     action,
+			privileges: priv,
+			state:      state,
+		})
+	}
+	return s
+}
+
+// certutilName returns the path that would be shown in commands, or the
+// bare tool name when it was not found.
+func certutilName() string {
+	if hasCertutil {
+		return certutilPath
+	}
+	return "certutil"
+}
+
+// nssSearchPaths lists the locations probed for NSS databases and browser
+// installations. The Unix nssDBs entries are skipped on Windows, where they
+// would resolve to meaningless relative paths because HOME is unset.
+func nssSearchPaths() []string {
+	searched := append([]string{}, FirefoxProfiles...)
+	searched = append(searched, firefoxPaths...)
+	if runtime.GOOS != "windows" {
+		searched = append(searched, nssDBs...)
+	}
+	return searched
 }
 
 func (m *mkcert) forEachNSSProfile(f func(profile string)) (found int) {

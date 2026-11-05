@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"encoding/asn1"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -108,4 +109,57 @@ func (m *mkcert) uninstallPlatform() bool {
 	fatalIfCmdErr(err, "security remove-trusted-cert", out)
 
 	return true
+}
+
+// planSystemStore builds the read-only dry-run plan for the macOS system
+// trust store. It only verifies certificate trust; it never runs the
+// "security" command, opens the keychain for writing or uses sudo.
+func (m *mkcert) planSystemStore(install bool) dryRunStore {
+	s := dryRunStore{name: "macOS system trust store (System.keychain)", detected: true}
+	priv := adminPrivilegesNote()
+	rootCert := filepath.Join(m.CAROOT, rootName)
+
+	if !binaryExists("security") {
+		s.available = false
+		s.diagnostic = fmt.Sprintf(`The "security" command was not found in PATH. Make sure macOS is intact `+
+			`(it ships at /usr/bin/security) or add it to PATH, then re-run. Until then, manually install %q `+
+			`with Keychain Access.`, rootCert)
+		return s
+	}
+	s.available = true
+
+	const keychain = "/Library/Keychains/System.keychain"
+	installed := m.caCert != nil && m.checkPlatform()
+
+	if install {
+		state := stateWouldInstall
+		if m.caCert == nil {
+			state = stateUnknown
+		} else if installed {
+			state = stateAlready
+		}
+		s.targets = append(s.targets, dryRunTarget{
+			path: keychain,
+			action: fmt.Sprintf(
+				`run "security add-trusted-cert -d -k %s %s", then export/edit/import the admin trust settings`,
+				keychain, rootCert),
+			privileges: priv,
+			state:      state,
+		})
+		return s
+	}
+
+	state := stateWouldRemove
+	if m.caCert == nil {
+		state = stateUnknown
+	} else if !installed {
+		state = stateAbsent
+	}
+	s.targets = append(s.targets, dryRunTarget{
+		path:       keychain,
+		action:     fmt.Sprintf(`run "security remove-trusted-cert -d %s"`, rootCert),
+		privileges: priv,
+		state:      state,
+	})
+	return s
 }

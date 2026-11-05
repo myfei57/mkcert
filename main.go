@@ -68,6 +68,11 @@ const advancedUsage = `Advanced options:
 	-CAROOT
 	    Print the CA certificate and key storage location.
 
+	-dry-run
+	    With -install or -uninstall, report the trust stores, targets and
+	    privilege requirements that would be used, without making any changes.
+	    Targets that already contain the CA are reported as already installed.
+
 	$CAROOT (environment variable)
 	    Set the CA certificate and key storage location. (This allows
 	    maintaining multiple local CAs in parallel.)
@@ -98,6 +103,7 @@ func main() {
 		clientFlag    = flag.Bool("client", false, "")
 		helpFlag      = flag.Bool("help", false, "")
 		carootFlag    = flag.Bool("CAROOT", false, "")
+		dryRunFlag    = flag.Bool("dry-run", false, "")
 		csrFlag       = flag.String("csr", "", "")
 		certFileFlag  = flag.String("cert-file", "", "")
 		keyFileFlag   = flag.String("key-file", "", "")
@@ -136,6 +142,9 @@ func main() {
 	if *installFlag && *uninstallFlag {
 		log.Fatalln("ERROR: you can't set -install and -uninstall at the same time")
 	}
+	if *dryRunFlag && !*installFlag && !*uninstallFlag {
+		log.Fatalln("ERROR: -dry-run can only be used with -install or -uninstall")
+	}
 	if *csrFlag != "" && (*pkcs12Flag || *ecdsaFlag || *clientFlag) {
 		log.Fatalln("ERROR: can only combine -csr with -install and -cert-file")
 	}
@@ -143,8 +152,8 @@ func main() {
 		log.Fatalln("ERROR: can't specify extra arguments when using -csr")
 	}
 	(&mkcert{
-		installMode: *installFlag, uninstallMode: *uninstallFlag, csrPath: *csrFlag,
-		pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag,
+		installMode: *installFlag, uninstallMode: *uninstallFlag, dryRun: *dryRunFlag,
+		csrPath: *csrFlag, pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag,
 		certFile: *certFileFlag, keyFile: *keyFileFlag, p12File: *p12FileFlag,
 	}).Run(flag.Args())
 }
@@ -154,6 +163,7 @@ const rootKeyName = "rootCA-key.pem"
 
 type mkcert struct {
 	installMode, uninstallMode bool
+	dryRun                     bool
 	pkcs12, ecdsa, client      bool
 	keyFile, certFile, p12File string
 	csrPath                    string
@@ -172,6 +182,13 @@ func (m *mkcert) Run(args []string) {
 	m.CAROOT = getCAROOT()
 	if m.CAROOT == "" {
 		log.Fatalln("ERROR: failed to find the default CA location, set one as the CAROOT env var")
+	}
+	if m.dryRun {
+		// Dry runs never create the CAROOT or the CA, and never touch the
+		// system trust stores: only read-only checks are performed.
+		caInfo := m.loadCADryRun()
+		m.dryRunReport(m.installMode, caInfo, len(args))
+		return
 	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
 	m.loadCA()
@@ -390,4 +407,166 @@ func commandWithSudo(cmd ...string) *exec.Cmd {
 		return exec.Command(cmd[0], cmd[1:]...)
 	}
 	return exec.Command("sudo", append([]string{"--prompt=Sudo password:", "--"}, cmd...)...)
+}
+
+// adminPrivilegesNote describes how the system trust store commands gain
+// privileges. It only inspects the environment; it never escalates.
+func adminPrivilegesNote() string {
+	if runtime.GOOS == "windows" {
+		return "administrator rights may be required for the machine-wide store; Windows may show an interactive security warning"
+	}
+	if u, err := user.Current(); err == nil && u.Uid == "0" {
+		return "running as root, no privilege escalation needed"
+	}
+	if !binaryExists("sudo") {
+		return `ROOT REQUIRED, but "sudo" is not available: run mkcert as root or install sudo`
+	}
+	return `root privileges through "sudo" (a password prompt may appear)`
+}
+
+// Dry-run report machinery. The plan* helpers in the truststore_*.go files
+// only perform read-only checks and must never execute the mutating
+// install/uninstall commands.
+
+type dryRunState string
+
+const (
+	stateWouldInstall dryRunState = "would-install"
+	stateAlready      dryRunState = "already-installed"
+	stateWouldRemove  dryRunState = "would-remove"
+	stateAbsent       dryRunState = "absent"
+	stateUnknown      dryRunState = "unknown"
+)
+
+// dryRunTarget is a single file, database or keychain entry that an
+// install/uninstall operation would check, write or remove.
+type dryRunTarget struct {
+	path       string
+	action     string
+	privileges string
+	state      dryRunState
+}
+
+// dryRunStore describes one trust store (system, NSS or Java) and the state
+// of all of its targets.
+type dryRunStore struct {
+	name       string
+	detected   bool   // the relevant software/store exists on this machine
+	available  bool   // the tools required to modify it automatically exist
+	diagnostic string // actionable remediation when detected/available fail
+	targets    []dryRunTarget
+}
+
+type dryRunCounters struct {
+	change, noop, unknown, blocked, undetected, skipped int
+}
+
+func (m *mkcert) dryRunReport(install bool, ca dryRunCAInfo, hostCount int) {
+	opWord, opFlag := "INSTALL", "-install"
+	if !install {
+		opWord, opFlag = "UNINSTALL", "-uninstall"
+	}
+	log.Printf("DRY RUN — %s plan for the local CA trust stores. No files or trust stores were modified. 🔍", opWord)
+	log.Println()
+
+	// Local CA section.
+	log.Println("Local CA")
+	log.Printf("  CAROOT: %s", m.CAROOT)
+	if ca.CAROOTExists {
+		log.Println("  - CAROOT directory: exists")
+	} else {
+		log.Println("  - CAROOT directory: missing (would be created with mode 0755)")
+	}
+	switch {
+	case ca.Err != nil:
+		log.Printf("  - %s: found but it could not be read: %v", rootName, ca.Err)
+	case ca.CertExists:
+		log.Printf("  - %s: exists", rootName)
+	default:
+		log.Printf("  - %s: missing (a new local CA would be created first)", rootName)
+	}
+	switch {
+	case !ca.CertExists:
+		log.Printf("  - %s: would be created together with the CA (mode 0400)", rootKeyName)
+	case ca.KeyExists:
+		log.Printf("  - %s: exists", rootKeyName)
+	default:
+		log.Printf("  - %s: missing (keyless mode: the CA can be trusted, but not used to issue certificates)", rootKeyName)
+	}
+	log.Println()
+
+	var c dryRunCounters
+	m.printDryRunStore("system", storeEnabled("system"), m.planSystemStore(install), &c)
+	m.printDryRunStore("nss", storeEnabled("nss"), m.planNSSStore(install), &c)
+	m.printDryRunStore("java", storeEnabled("java"), m.planJavaStore(install), &c)
+
+	log.Printf("Summary: %d target(s) would change, %d already present or absent (no-op), %d unknown, %d store(s) unavailable, %d not detected, %d skipped via TRUST_STORES.",
+		c.change, c.noop, c.unknown, c.blocked, c.undetected, c.skipped)
+	log.Printf("Re-run %s without -dry-run to execute these actions. 👈", opFlag)
+	if hostCount > 0 {
+		log.Printf("Note: -dry-run reports trust store operations only; generation of %d certificate(s) was skipped.", hostCount)
+	}
+}
+
+func (m *mkcert) printDryRunStore(key string, enabled bool, s dryRunStore, c *dryRunCounters) {
+	log.Printf("[%s] %s", key, s.name)
+	if !enabled {
+		c.skipped++
+		log.Println("  SKIPPED: not selected by the TRUST_STORES environment variable.")
+		log.Println()
+		return
+	}
+	if !s.detected {
+		c.undetected++
+		log.Println("  NOT DETECTED: no action would be taken.")
+		if s.diagnostic != "" {
+			log.Printf("  -> %s", s.diagnostic)
+		}
+		log.Println()
+		return
+	}
+	if !s.available {
+		c.blocked++
+		log.Println("  UNAVAILABLE: this trust store can't be modified automatically.")
+		if s.diagnostic != "" {
+			log.Printf("  -> %s", s.diagnostic)
+		}
+	}
+	if len(s.targets) == 0 && s.available {
+		log.Println("  No targets.")
+	}
+	for _, t := range s.targets {
+		switch t.state {
+		case stateWouldInstall, stateWouldRemove:
+			c.change++
+		case stateAlready, stateAbsent:
+			c.noop++
+		default:
+			c.unknown++
+		}
+		log.Printf("  [%s] %s", dryRunStateLabel(t.state), t.path)
+		log.Printf("      action: %s", t.action)
+		if t.privileges != "" {
+			log.Printf("      privileges: %s", t.privileges)
+		}
+	}
+	if s.available && s.diagnostic != "" {
+		log.Printf("  Note: %s", s.diagnostic)
+	}
+	log.Println()
+}
+
+func dryRunStateLabel(state dryRunState) string {
+	switch state {
+	case stateWouldInstall:
+		return "WOULD INSTALL"
+	case stateAlready:
+		return "ALREADY INSTALLED — no change"
+	case stateWouldRemove:
+		return "WOULD REMOVE"
+	case stateAbsent:
+		return "NOT PRESENT — nothing to remove"
+	default:
+		return "UNKNOWN"
+	}
 }
